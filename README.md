@@ -1,6 +1,6 @@
 # Climbing the Ladder of Interpretability with Counterfactual Concept Bottleneck Models
 
-Repository related to the **"Climbing the Ladder of Interpretability with Counterfactual Concept Bottleneck Models"** paper submitted to IJCAI 2024.
+Repository related to the **"Climbing the Ladder of Interpretability with Counterfactual Concept Bottleneck Models"** paper.
 
 ### Instruction to set up the repository
 
