@@ -1,0 +1,40 @@
+program: main.py
+method: grid
+parameters:
+  seed:
+    values:
+    - 0 
+    - 8
+    - 13
+    - 24
+    - 42
+  learning_rate:
+    values:
+    - {'dsprites': 0.005, 'mnist': 0.005, 'cub': 0.005}
+  model:
+    values:
+    - 'Oracle'
+    - 'DeepNN'
+    - 'StandardCBM'
+    - 'CFCBM'
+    - 'VCNET'
+    - 'VAECF'
+    - 'CCHVAE'
+    - 'BayCon'
+  dataset:
+    values:
+    - 'dsprites'
+    - 'mnist'
+    - 'cub'
+  emb_size:
+    values:
+    - 128 
+  batch_size:
+    values:
+    - 1024
+  device:
+    values:
+    - 'cpu'
+  epochs:
+    values:
+    - {'dsprites': 75, 'mnist': 150, 'cub': 150}
