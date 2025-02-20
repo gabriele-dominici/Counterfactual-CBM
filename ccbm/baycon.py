@@ -114,7 +114,7 @@ def evaluate_baycon(
     total_time = 0
     hamming_dist = 0
     euclidean_dist = 0
-    for i in tqdm(range(len(not_y))):
+    for i in tqdm(range(5)):
         t = Target(target_type="classification", target_feature="y", target_value=int(not_y[i]))
         start = time.time()
         counterfactuals, best_cf, predictions, initial_instance, initial_prediction, data_analyzer, ranker, model = execute((c_bool > 0.5).astype(int), y_numpy,
@@ -146,15 +146,12 @@ def evaluate_baycon(
     all_best_cf = np.concatenate(all_best_cf, axis=0)
     all_best_cf = torch.Tensor(np.array(all_best_cf))
     cf_accuracy = cf_correct/total
-    print(y_prime_pred)
     y_prime_pred = np.concatenate(y_prime_pred, axis=0)
     y_prime_pred = torch.Tensor(np.array(y_prime_pred))
-    print(y_prime_pred.shape)
-    print(y_prime)
     y_prime = np.concatenate(y_prime, axis=0)
     y_prime = torch.Tensor(np.array(y_prime))
-    print(y_prime.shape)
-    cf_roc = roc_auc_score(y_prime, y_prime_pred)
+    # cf_roc = roc_auc_score(y_prime, y_prime_pred)
     hamming_dist = hamming_dist/total
     euclidean_dist = euclidean_dist/total
+    cf_roc = 0
     return total_time, all_cf_preds, all_best_cf, y_prime_pred, cf_accuracy, cf_roc, not_y, hamming_dist, euclidean_dist

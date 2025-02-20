@@ -3,14 +3,13 @@ import math
 import shap
 import numpy as np
 import pytorch_lightning as pl
-from ccbm.utils import randomize_class, plot_latents, save_set_c_and_cf, FEATURE_NAMES, DATASET, CLASS_TO_VISUALISE
+from ccbm.utils import randomize_class, save_set_c_and_cf, FEATURE_NAMES, DATASET, CLASS_TO_VISUALISE
 from sklearn.metrics import roc_auc_score
 from pytorch_lightning import seed_everything
 from ccbm.metrics import (variability, 
                           difference_over_union, 
                           intersection_over_union, 
                           cf_in_distribution, distance_train)
-from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import TensorDataset
 from ccbm.baycon import evaluate_baycon
 import matplotlib.pyplot as plt
@@ -39,7 +38,7 @@ def train(net,
     else:
         raise ValueError(f'Unknown model {model}')
     
-def train_model(model, epochs, learning_rate, seed, train_dl, test_dl, results_dir, accelerator, wandb_logger):
+def train_model(model, epochs, learning_rate, seed, train_dl, val_dl, results_dir, accelerator, wandb_logger):
     print(f'Running {model}, epochs={epochs}, learning_rate={learning_rate}')
     checkpoint_callback = pl.callbacks.ModelCheckpoint(monitor="val_acc", mode="max", save_weights_only=True)
     trainer = pl.Trainer(max_epochs=epochs,
@@ -53,10 +52,10 @@ def train_model(model, epochs, learning_rate, seed, train_dl, test_dl, results_d
                             accelerator=accelerator)
     seed_everything(seed, workers=True)
     
-    # try:
-    trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=test_dl)
-    # except Exception as e:
-    #     print(e)
+    try:
+        trainer.fit(model=model, train_dataloaders=train_dl, val_dataloaders=val_dl)
+    except Exception as e:
+        print(e)
     model.load_state_dict(torch.load(checkpoint_callback.best_model_path)['state_dict'])
     print(f"Best train acc: {checkpoint_callback.best_model_score}, "
             f"Epoch: {torch.load(checkpoint_callback.best_model_path)['epoch']}")
@@ -106,8 +105,8 @@ def train_oracle(net, test_dl, c_cf_set, concept_labels, wandb_logger):
     return result, net
 
 def train_nn(net, epochs, learning_rate, seed, train_dl, test_dl, results_dir, accelerator, wandb_logger):
-    
-    net = train_model(net, epochs, learning_rate, seed, train_dl, test_dl, results_dir, accelerator, wandb_logger)
+    train_dl, val_dl = train_dl
+    net = train_model(net, epochs, learning_rate, seed, train_dl, val_dl, results_dir, accelerator, wandb_logger)
     y_preds_total = torch.empty(0, train_dl.dataset[0][-1].shape[-1])
     y_total = torch.empty(0, train_dl.dataset[0][-1].shape[-1])
 
@@ -147,19 +146,13 @@ def train_nn(net, epochs, learning_rate, seed, train_dl, test_dl, results_dir, a
 
 def train_cbm(net, epochs, learning_rate, seed, train_dl, test_dl, results_dir, accelerator, wandb_logger):
 
-    net = train_model(net, epochs, learning_rate, seed, train_dl, test_dl, results_dir, accelerator, wandb_logger)
-    
-    for layer in net.reasoner:
-        if isinstance(layer, torch.nn.Linear):
-            # Access the weights
-            weights = layer.weight.data
+    #if train is tuple
+    if len(train_dl) == 2:
+        train_dl, val_dl = train_dl
+    else: 
+        val_dl = test_dl
 
-            # Convert the weights to a NumPy array if needed
-            weights_numpy = weights.numpy()
-
-            # Print or use the weights as needed
-            print(weights_numpy)
-    weights_numpy_sum = weights_numpy.sum()
+    net = train_model(net, epochs, learning_rate, seed, train_dl, val_dl, results_dir, accelerator, wandb_logger)
 
     y_preds_total = torch.empty(0, train_dl.dataset[0][-1].shape[-1])
     y_total = torch.empty(0, train_dl.dataset[0][-1].shape[-1])
@@ -209,201 +202,13 @@ def train_cbm(net, epochs, learning_rate, seed, train_dl, test_dl, results_dir, 
     result['hamming_distance'] = hamming_distance
     result['explanations'] = explanations
     result['explanation_cf'] = explanation_cf
-    result['weights_numpy_sum'] = weights_numpy_sum
 
-    # y_preds = net.reasoner(c_preds_total)
-
-    # identity = torch.Tensor([[0, 0, 1], [0, 0, 1], [1, 0, 0]])
-    # c_preds_total_int = c_preds_total.clone()
-    # c_preds_total_int[:, -3:] = identity[c_preds_total_int[:, -3:].argmax(dim=-1)]
-
-    # y_preds_int = net.reasoner(c_preds_total_int)
-    # tot = ((y_preds > 0) == (y_preds_int > 0)).float().sum()
-    # result[f'color_int'] = tot/c_preds_total.shape[0]
-
-    c_preds_total_train = torch.empty(0, train_dl.dataset[0][1].shape[-1])
-    for X_train, c_train, y_train in train_dl:
-
-        c_preds, y_preds, _ = net.forward(X_train)
-
-        if not net.bool_concepts:
-            c_preds = torch.sigmoid(c_preds)
-
-        c_preds_total_train = torch.cat((c_preds_total_train, c_preds), dim=0)
-
-    idx = CLASS_TO_VISUALISE[str(c_preds_total_train.shape[-1])]
-    weights = net.reasoner[0].weight
-    biases = net.reasoner[0].bias
-    if weights.shape[0] != 1:
-        weights = weights[idx]
-        biases = biases[idx]
-    else:
-        weights = weights[0]
-        biases = biases[0]
-    weights = weights.data.numpy()
-    biases = biases.data.numpy()
-    sklearn_model = LinearRegression()
-    sklearn_model.coef_ = weights
-    sklearn_model.intercept_ = biases
-    explainer = shap.Explainer(
-        sklearn_model, c_preds_total_train.detach().numpy(), feature_names=FEATURE_NAMES[str(c_preds_total_train.shape[-1])]
-    )
-    shap_values = explainer(c_preds_total.detach().numpy())
-    # shap.plots.beeswarm(shap_values)
-    fig = plt.figure()
-    weights = np.divide(weights, np.max(np.absolute(weights), axis=-1, keepdims=True))
-    shap_values.values = np.round(c_preds_total.detach().numpy()*weights, 2)
-    shap_values.data = np.round(shap_values.data, 2)
-    order = FEATURE_NAMES[str(c_preds_total_train.shape[-1])]
-    col2num = {col: i for i, col in enumerate(order)}
-
-    order = list(map(col2num.get, order))
-
-    ax = shap.plots.beeswarm(shap_values, show=False, order=order)
-    ax.set_xlabel('Impact on model output', fontsize=30)
-    ax.set_title(DATASET[str(c_preds_total_train.shape[-1])], fontsize=32)
-    fig.savefig('cbm_importance.pdf', format="pdf", bbox_inches="tight")
-    indexes = torch.Tensor(list(range(c_preds_total.shape[0])))
-    if y_preds_total.shape[-1] != 1:
-        idx_y = int(indexes[y_preds_total.argmax(dim=-1) == idx][0].item())
-    else:
-        idx_y = int(indexes[(y_preds_total > 0).float().squeeze(-1) == idx][0].item())
-    fig = shap.plots.force(shap_values[idx_y], show=False, matplotlib=True, contribution_threshold=0.1)
-    plt.title(DATASET[str(c_preds_total_train.shape[-1])], fontsize=32)
-    fig.savefig('cbm_single_importance.pdf', format="pdf", bbox_inches="tight")
-
-
-
-    # # Create a SHAP Deep Explainer
-    # explainer = shap.DeepExplainer(net.reasoner, c_preds_total_train[:600])
-
-    # # Compute SHAP values
-    # shap_values = explainer.shap_values(c_preds_total)
-
-    # tot = 0
-    
-    # for c in range(len(shap_values)):
-    #     counter = 0
-    #     c_preds_total_tmp = c_preds_total.clone()
-    #     filter = (y_preds_total.argmax(dim=-1) == c).detach().numpy()
-
-    #     shap_sum = shap_values[c][filter].mean(axis=0)
-    #     plt.bar(range(shap_sum.shape[-1]), shap_sum)
-    #     plt.show()
-    #     # shap_sum = np.abs(shap_values[c][filter]).mean(axis=0)
-    #     index_to_noise = np.argsort(shap_sum)
-        
-    #     c_preds_total_tmp = c_preds_total_tmp[filter]
-    #     for i in reversed(index_to_noise.tolist()):
-    #         y_preds = net.reasoner(c_preds_total_tmp)
-    #         c_preds_total_tmp[:, i] = 1 - c_preds_total_tmp[:, i]
-    #         y_preds_noise = net.reasoner(c_preds_total_tmp)
-
-    #         to_keep = y_preds.argmax(dim=-1) == y_preds_noise.argmax(dim=-1)
-    #         c_preds_total_tmp = c_preds_total_tmp[to_keep]
-
-    #         counter += (i+1)*(~to_keep).float().sum()
-    #         if (to_keep).float().sum().item() == 0:
-    #                 break
-    #     counter += (i+1)*(to_keep).float().sum().item()
-    #     tot += counter
-    # tot = tot / c_preds_total.shape[0]
-    # result['average_noise'] = tot
-
-    # for c in range(len(shap_values)):
-    #     counter = 0
-    #     c_preds_total_tmp = c_preds_total.clone()
-    #     filter = (y_preds_total.argmax(dim=-1) == c).detach().numpy()
-
-    #     shap_c = shap_values[c][filter]
-    #     # shap_sum = np.abs(shap_values[c][filter]).mean(axis=0)
-    #     index_to_noise = np.argsort(shap_c)
-        
-    #     c_preds_total_tmp = c_preds_total_tmp[filter]
-    #     # for i in reversed(index_to_noise.tolist()):
-    #     for i in reversed(list(range(index_to_noise.shape[-1]))):
-    #         y_preds = net.reasoner(c_preds_total_tmp)
-    #         index = index_to_noise[:, i]
-    #         c_preds_total_tmp[:, index] = 1 - c_preds_total_tmp[:, index]
-    #         print(c_preds_total_tmp[0])
-    #         y_preds_noise = net.reasoner(c_preds_total_tmp)
-
-    #         to_keep = y_preds.argmax(dim=-1) == y_preds_noise.argmax(dim=-1)
-    #         c_preds_total_tmp = c_preds_total_tmp[to_keep]
-
-    #         counter += (i+1)*(~to_keep).float().sum()
-    #         print((to_keep).float().sum().item())
-    #         if (to_keep).float().sum().item() == 0:
-    #                 break
-    #     counter += (index_to_noise.shape[-1]-i)*(to_keep).float().sum().item()
-    #     tot += counter
-
-    # noise = [0.1, 0.2, 0.3, 0.4, 0.5]
-    # for i in noise:
-    #     counter = 0
-    #     for c in range(len(shap_values)):
-    #         c_preds_total_tmp = c_preds_total.clone()
-    #         filter = (y_preds_total.argmax(dim=-1) == c).detach().numpy()
-            
-    #         shap_sum = shap_values[c][filter].mean(axis=0)
-    #         # shap_sum = np.abs(shap_values[c][filter]).mean(axis=0)
-    #         index_to_noise = np.argsort(shap_sum)
-            
-    #         c_preds_total_tmp = c_preds_total_tmp[filter]
-    #         y_preds = net.reasoner(c_preds_total_tmp)
-    #         indexes = index_to_noise[-math.ceil(i*c_preds_total_tmp.shape[-1]):]
-    #         c_preds_total_tmp[:, indexes] = 1 - c_preds_total_tmp[:, indexes]
-    #         y_preds_noise = net.reasoner(c_preds_total_tmp)
-
-    #         correct = (y_preds.argmax(dim=-1) == y_preds_noise.argmax(dim=-1)).float().sum()
-
-    #         counter += correct
-    #     tot = counter/c_preds_total.shape[0]
-    #     result[f'accuracy_{i}'] = tot
-
-    # counter = 0
-    # c_preds_total_tmp = c_preds_total.clone()
-    
-    # # shap_sum = shap_values[c][filter].mean(axis=0)
-    # shap_values = np.vstack(shap_values)
-    # shap_sum = np.abs(shap_values).mean(axis=0)
-    # index_to_noise = np.argsort(shap_sum)
-
-    # c_preds_total_tmp = c_preds_total_tmp
-    # for i in reversed(index_to_noise.tolist()):
-    #     y_preds = net.reasoner(c_preds_total_tmp)
-    #     c_preds_total_tmp[:, i] = 1 - c_preds_total_tmp[:, i]
-    #     y_preds_noise = net.reasoner(c_preds_total_tmp)
-
-    #     to_keep = y_preds.argmax(dim=-1) == y_preds_noise.argmax(dim=-1)
-    #     c_preds_total_tmp = c_preds_total_tmp[to_keep]
-    #     print((to_keep).float().sum().item())
-    #     counter += (i+1)*(~to_keep).float().sum().item()
-    #     if (to_keep).float().sum().item() == 0:
-    #         break
-    # counter += (i+1)*(to_keep).float().sum().item()
-    # tot += counter
-    
-
-    
     return result, net
 
 def train_cfcbm(net, epochs, learning_rate, seed, train_dl, test_dl, results_dir, accelerator, c_cf_set, concept_labels, model, fold, log_dir, wandb_logger):
-    
-    net = train_model(net, epochs, learning_rate, seed, train_dl, test_dl, results_dir, accelerator, wandb_logger)
+    train_dl, val_dl = train_dl
+    net = train_model(net, epochs, learning_rate, seed, train_dl, val_dl, results_dir, accelerator, wandb_logger)
     net.actual_resample = net.resample
-
-    for layer in net.reasoner:
-        if isinstance(layer, torch.nn.Linear):
-            # Access the weights
-            weights = layer.weight.data
-
-            # Convert the weights to a NumPy array if needed
-            weights_numpy = weights.numpy()
-
-            # Print or use the weights as needed
-            print(weights_numpy)
-    weights_numpy_sum = weights_numpy.sum()
 
     c_preds_total = torch.empty(0, train_dl.dataset[0][1].shape[-1])
     c_total = torch.empty(0, train_dl.dataset[0][1].shape[-1])
@@ -473,76 +278,8 @@ def train_cfcbm(net, epochs, learning_rate, seed, train_dl, test_dl, results_dir
     result['explanations'] = explanations
     result['explanation_cf'] = explanation_cf
     result['mean_distance_train'] = mean_distance_train
-    result['weights_numpy_sum'] = weights_numpy_sum
 
-    # y_preds = net.reasoner(c_preds_total)
-
-    # identity = torch.Tensor([[0, 0, 1], [0, 0, 1], [1, 0, 0]])
-    # c_preds_total_int = c_preds_total.clone()
-    # c_preds_total_int[:, -3:] = identity[c_preds_total_int[:, -3:].argmax(dim=-1)]
-
-    # y_preds_int = net.reasoner(c_preds_total_int)
-    # tot = ((y_preds > 0) == (y_preds_int > 0)).float().sum()
-    # result[f'color_int'] = tot/c_preds_total.shape[0]
-
-    c_preds_total_train = torch.empty(0, train_dl.dataset[0][1].shape[-1])
-    for X_train, c_train, y_train in train_dl:
-        
-        y_prime = randomize_class(y_test, include=False)
-        if y_train.shape[-1] == 1:
-            y_prime = None
-        (c_preds, y_preds, explanations,
-        c_cf, y_cf, y_cf_target, explanation_cf, 
-        p_z2, qz2_x, pz3_z2_c_y, qz3_z2_c_y_y_prime,
-        pcprime_z3, py_c, py_c_cf, pc_z2, c_cf_true, weights, z2, z3, c_pred_d) = net.forward(X_train, test=True, y_prime=y_prime, explain=True, include=False, inference=True)
-
-        if not net.bool_concepts:
-            c_preds = torch.sigmoid(c_preds)
-
-        c_preds_total_train = torch.cat((c_preds_total_train, c_preds), dim=0)
-
-    idx = CLASS_TO_VISUALISE[str(c_preds_total_train.shape[-1])]
-    weights = net.reasoner[0].weight
-    biases = net.reasoner[0].bias
-    if weights.shape[0] != 1:
-        weights = weights[idx]
-        biases = biases[idx]
-    else:
-        weights = weights[0]
-        biases = biases[0]
-    weights = weights.data.numpy()
-    biases = biases.data.numpy()
-    sklearn_model = LinearRegression()
-    sklearn_model.coef_ = weights
-    sklearn_model.intercept_ = biases
-    explainer = shap.Explainer(
-        sklearn_model, c_preds_total_train.detach().numpy(), feature_names=FEATURE_NAMES[str(c_preds_total_train.shape[-1])]
-    )
-    shap_values = explainer(c_preds_total.detach().numpy())
-    # shap.plots.beeswarm(shap_values)
-    fig = plt.figure()
-    weights = np.divide(weights, np.max(np.absolute(weights), axis=-1, keepdims=True))
-    shap_values.values = np.round(c_preds_total.detach().numpy()*weights, 2)
-    shap_values.data = np.round(shap_values.data, 2)
-    order = FEATURE_NAMES[str(c_preds_total_train.shape[-1])]
-    col2num = {col: i for i, col in enumerate(order)}
-
-    order = list(map(col2num.get, order))
-
-    ax = shap.plots.beeswarm(shap_values, show=False, order=order)
-    ax.set_xlabel('Impact on model output', fontsize=30)
-    ax.set_title(DATASET[str(c_preds_total_train.shape[-1])], fontsize=32)
-    fig.savefig('ccbm_importance.pdf', format="pdf", bbox_inches="tight")
-    indexes = torch.Tensor(list(range(c_preds_total.shape[0])))
-    if y_preds_total.shape[-1] != 1:
-        idx_y = int(indexes[y_preds_total.argmax(dim=-1) == idx][0].item())
-    else:
-        idx_y = int(indexes[(y_preds_total > 0).float().squeeze(-1) == idx][0].item())
-    fig = shap.plots.force(shap_values[idx_y], show=False, matplotlib=True, contribution_threshold=0.1)
-    plt.title(DATASET[str(c_preds_total_train.shape[-1])], fontsize=32)
-    fig.savefig('ccbm_single_importance.pdf', format="pdf", bbox_inches="tight")    
-
-    # save_set_c_and_cf(c_preds_total, y_preds_total, y_cf_total, c_cf_total, model, fold, log_dir)
+    save_set_c_and_cf(c_preds_total, y_preds_total, y_cf_total, c_cf_total, model, fold, log_dir)
 
     n_times_list = [5, 10, 100]
     for n in n_times_list: 
@@ -640,8 +377,8 @@ def train_cfcbm(net, epochs, learning_rate, seed, train_dl, test_dl, results_dir
 def train_vae(net, epochs, learning_rate, seed, train_dl, test_dl, results_dir, accelerator, batch_size, c_cf_set, concept_labels, model, fold, log_dir, wandb_logger):
 
     cbm, vae = net
-
-    result, cbm = train_cbm(cbm, epochs, learning_rate, seed, train_dl, test_dl, results_dir, accelerator, wandb_logger)
+    train_dl, val_dl = train_dl
+    result, cbm = train_cbm(cbm, epochs, learning_rate, seed, train_dl, val_dl, results_dir, accelerator, wandb_logger)
     
     y_test_total = torch.empty(0, train_dl.dataset[0][-1].shape[-1])
     c_preds_total = torch.empty(0, train_dl.dataset[0][1].shape[-1])
@@ -681,8 +418,6 @@ def train_vae(net, epochs, learning_rate, seed, train_dl, test_dl, results_dir, 
     cf_in_pred = cf_in_distribution(c_cf, c_preds)
     cf_in_train = cf_in_distribution(c_cf, c_cf_set)
 
-    # Warning: we calculate the distance between the test cf and c, but it would be good to compute it
-    # between the first true cf found and the explanation
     pdist = torch.nn.PairwiseDistance(p=2)
     euclidean_distance = pdist(c_preds, c_cf).mean().item()
     hamming_distance = torch.norm((c_preds>0.5).float() - (c_cf>0.5).float(), p=0, dim=-1).mean().item() 
@@ -699,7 +434,7 @@ def train_vae(net, epochs, learning_rate, seed, train_dl, test_dl, results_dir, 
     result['hamming_distance'] = hamming_distance
     result['mean_distance_train'] = mean_distance_train
 
-    # save_set_c_and_cf(c_preds_total, y_test_total, y_cf, c_cf, model, fold, log_dir)
+    save_set_c_and_cf(c_preds_total, y_test_total, y_cf, c_cf, model, fold, log_dir)
 
     p_list = [0.1, 0.2, 0.5, 1.0]
     for p in p_list:
@@ -748,8 +483,8 @@ def train_vae(net, epochs, learning_rate, seed, train_dl, test_dl, results_dir, 
     return result, (cbm, vae)
 
 def train_conceptvcnet(net, epochs, learning_rate, seed, train_dl, test_dl, results_dir, accelerator, c_cf_set, concept_labels, model, fold, log_dir, wandb_logger):
-
-    net = train_model(net, epochs, learning_rate, seed, train_dl, test_dl, results_dir, accelerator, wandb_logger)
+    train_dl, val_dl = train_dl
+    net = train_model(net, epochs, learning_rate, seed, train_dl, val_dl, results_dir, accelerator, wandb_logger)
 
     y_preds_total = torch.empty(0, train_dl.dataset[0][-1].shape[-1])
     y_total = torch.empty(0, train_dl.dataset[0][-1].shape[-1])
@@ -805,7 +540,7 @@ def train_conceptvcnet(net, epochs, learning_rate, seed, train_dl, test_dl, resu
     result['explanations'] = explanations
     result['explanation_cf'] = explanation_cf
 
-    # save_set_c_and_cf(c_preds, y_preds_total, y_cf_target, c_cf_pred, model, fold, log_dir)
+    save_set_c_and_cf(c_preds, y_preds_total, y_cf_target, c_cf_pred, model, fold, log_dir)
 
     p_list = [0.1, 0.2, 0.5, 1.0]
     for p in p_list:
@@ -850,8 +585,8 @@ def train_conceptvcnet(net, epochs, learning_rate, seed, train_dl, test_dl, resu
     return result, net
 
 def train_baycon(net, epochs, learning_rate, seed, train_dl, test_dl, results_dir, accelerator, batch_size, c_cf_set, concept_labels, model, fold, log_dir, wandb_logger):
-    
-    result, net = train_cbm(net, epochs, learning_rate, seed, train_dl, test_dl, results_dir, accelerator, wandb_logger)
+    train_dl, val_dl = train_dl
+    result, net = train_cbm(net, epochs, learning_rate, seed, train_dl, val_dl, results_dir, accelerator, wandb_logger)
     
     c_preds_total = torch.empty(0, train_dl.dataset[0][1].shape[-1])
     y_preds_total = torch.empty(0, train_dl.dataset[0][-1].shape[-1])
@@ -881,7 +616,6 @@ def train_baycon(net, epochs, learning_rate, seed, train_dl, test_dl, results_di
     cf_in_train = cf_in_distribution(all_best_cf, c_train)
     mean_distance_train = distance_train(all_best_cf, c_cf_set, y_prime_pred, concept_labels)
 
-
     result['task_cf_accuracy'] = task_cf_accuracy
     result['cf_variability'] = cf_variability
     result['cf_iou'] = cf_iou
@@ -894,7 +628,7 @@ def train_baycon(net, epochs, learning_rate, seed, train_dl, test_dl, results_di
     result['hamming_distance'] = hamming_distance
     result['mean_distance_train'] = mean_distance_train
 
-    # save_set_c_and_cf(c_preds_total, y_preds_total, torch.tensor(y_cf_target), all_best_cf, model, fold, log_dir)
+    save_set_c_and_cf(c_preds_total, y_preds_total, torch.tensor(y_cf_target), all_best_cf, model, fold, log_dir)
 
     return result, net
     

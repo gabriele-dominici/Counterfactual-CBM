@@ -2,7 +2,6 @@ import torch
 import numpy as np
 import os
 import shap
-from ccbm.data import xor, trigonometry
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 import pandas as pd
@@ -93,11 +92,6 @@ class RandomSamplerClassBatch(torch.utils.data.RandomSampler):
                 yield from torch.randperm(n, generator=generator).tolist()
             yield from torch.randperm(n, generator=generator).tolist()[:self.num_samples % n]
 
-
-def sample_bernoulli(distribution):
-    sig = torch.sigmoid(distribution.logits)
-    return distribution.sample() - sig.detach() + sig
-
 def extract_concepts(v):
       idxes = np.where(v == 1)[0]
       if len(idxes) == 0:
@@ -116,35 +110,25 @@ def load_data(dataset_name, n_samples=0, random_seed=42, fold=1, split='train'):
         save_dir = f'./embeddings/{dataset_name}'
         train_embeddings_file = os.path.join(save_dir, f'{split}_embeddings.pt')
         X, c, y = torch.load(train_embeddings_file)
+        # y = y[:, 1]
+        # print(y)
+        if dataset_name == 'chestmnist':
+            # randomly sample y = 0 and y = 1 with equal probability
+            y_1_idx_to_keep = (y == 1)
+            print(y_1_idx_to_keep.sum())
+            list_to_cut = [1]*y_1_idx_to_keep.sum()*1 + [0]*(y_1_idx_to_keep.shape[0]-y_1_idx_to_keep.sum()*1)
+            y_0_idx_to_keep = ((y == 0) * torch.tensor(list_to_cut)) > 0
+            print(y_0_idx_to_keep.sum())
+            X = torch.cat((X[y_0_idx_to_keep, :], X[y_1_idx_to_keep, :]), dim=0)
+            c = torch.cat((c[y_0_idx_to_keep, :], c[y_1_idx_to_keep, :]), dim=0)
+            y = torch.cat((y[y_0_idx_to_keep], y[y_1_idx_to_keep]), dim=0).unsqueeze(-1).long()
+            # shuffle
+            idx = torch.randperm(X.shape[0])
+            X = X[idx]
+            c = c[idx]
+            y = y[idx]
+            print(X.shape, c.shape, y.shape)
     return X, c, y
-
-def plot_latents(z2, z3, y_preds, y_cf):
-    # unify z2 and z3
-    zeros = torch.zeros(z2.shape[0])
-    ones = torch.ones(z3.shape[0])
-    labels = torch.cat((zeros, ones), dim=0).detach().numpy()
-    z2_concat = torch.concat((z2, z3), dim=0).detach().numpy()
-    z2_embedded = TSNE(n_components=2).fit_transform(z2_concat)
-    # divide again z2 and z3 
-    z2 = z2_embedded[:z2.shape[0]]
-    z3 = z2_embedded[z2.shape[0]:]
-    fig, ax = plt.subplots(figsize=(12, 10))
-    scatter1 = ax.scatter(z2[:1000, 0], z2[:1000, 1], c=(y_preds[:1000].argmax(dim=-1)).detach().numpy(), cmap=plt.cm.RdBu, s=150, edgecolors='w')
-    scatter2 = ax.scatter(z3[:1000, 0], z3[:1000, 1], c=(y_cf[:1000].argmax(dim=-1)).detach().numpy(), cmap=plt.cm.RdBu, s=150, edgecolors='w', marker='x')
-    legend1 = ax.legend(*scatter1.legend_elements(),
-                        loc="lower left", title="Classes", fontsize='12')
-    ax.add_artist(legend1)
-    plt.title('t-SNE on z2 and z3', fontsize=32)
-    plt.tight_layout()
-    # plt.show()
-    # draw()
-    import seaborn as sns
-    z = pd.DataFrame(z2_embedded, columns=['f1', 'f2'])
-    z['z'] = labels
-    sns.kdeplot(data=z, x="f1", y="f2", hue="z")
-    # plt.show()
-    # draw()
-
 
 def save_set_c_and_cf(c_preds, y_preds, y_cf, c_cf, model_name, fold, log_dir):
     cf_bool = (c_cf > 0.5).float().detach().numpy()
@@ -161,6 +145,13 @@ def save_set_c_and_cf(c_preds, y_preds, y_cf, c_cf, model_name, fold, log_dir):
     c_df = pd.DataFrame(zip(c_bool, y_pred_index))
     counts = c_df.groupby([0,1]).value_counts().sort_values(ascending=False).reset_index(name='count')
     counts.to_csv(os.path.join(log_dir, f'C_{model_name}_{fold}.csv'))
+    # rename cf_df columns
+    cf_df.columns = [2, 3]
+    union = pd.concat([c_df, cf_df], axis=1)
+    print(union)
+    counts = union.groupby([0,2]).value_counts().sort_values(ascending=False).reset_index(name='count')
+    counts.to_csv(os.path.join(log_dir, f'CF_C_{model_name}_{fold}.csv'))
+
 
 def print_concept_importance(net, idx, c_preds_total_train, c_preds_total, show=True):
     weights = net.reasoner[0].weight

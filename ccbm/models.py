@@ -4,21 +4,13 @@ import numpy as np
 import torch
 import math
 import time
-from torch import optim
-from ccbm.utils import randomize_class, sample_bernoulli
-from torch.optim import AdamW
-from sklearn.metrics import accuracy_score, roc_auc_score, f1_score
+from ccbm.utils import randomize_class
+from sklearn.metrics import roc_auc_score
 import pytorch_lightning as pl
-from torch.distributions import kl_divergence
-from torch.nn.functional import one_hot
-from torch.nn import CrossEntropyLoss, BCELoss, ModuleList, BCEWithLogitsLoss, KLDivLoss
-from torch_explain.nn.semantics import Logic, ProductTNorm
+from torch.nn import CrossEntropyLoss, BCELoss, BCEWithLogitsLoss
 import torch.nn.functional as F 
 from tqdm import tqdm
 import random
-
-from ccbm.layers import ConceptReasoningLayer
-from ccbm.metrics import variability, intersection_over_union, difference_over_union
 
 EPS = 1e-9
 
@@ -56,10 +48,6 @@ class Oracle():
         y_target = y_target.unsqueeze(dim=1)
         y_target_extended = y_target.repeat(1, y.shape[0]).to(y.device)
         y_extended = y.repeat(y_target.shape[0], 1)
-        # to exclude the true class examples
-        # filter = y_test == y
-        # dist[filter] = 10000000
-        # to exclude example of others classes
         filter = y_target_extended != y_extended
         dist[filter] = 10000000
         cf_indexes = torch.argsort(dist, dim=-1)[:, 0]
@@ -69,7 +57,7 @@ class Oracle():
         
 
 class NeuralNet(pl.LightningModule):
-    def __init__(self, input_features: int, n_classes: int, emb_size: int, learning_rate: float = 0.01):
+    def __init__(self, input_features: int, n_classes: int, emb_size: int, learning_rate: float = 0.01, pos_weight=None):
         super().__init__()
         self.input_features = input_features
         self.n_classes = n_classes
@@ -79,7 +67,7 @@ class NeuralNet(pl.LightningModule):
             self.cross_entropy = CrossEntropyLoss(reduction="mean")
         else:
             self.cross_entropy = BCEWithLogitsLoss()
-        self.bce = BCELoss(reduction="mean")
+        self.bce = BCELoss(reduction="mean", weight=pos_weight)
         self.bce_log = BCEWithLogitsLoss(reduction="mean")
         self.randomize_class = randomize_class
 
@@ -90,27 +78,16 @@ class NeuralNet(pl.LightningModule):
     @abstractmethod
     def _unpack_input(self, I):
         raise NotImplementedError
-    
-    
-    def _sample_different_label(self, y):
-        not_y = []
-        if self.n_classes == 1:
-            return torch.ones_like(y).long().to(y.device) - y
-        else:
-            y = y.argmax(dim=1)
-            for el in y:
-                possible_labels = list(range(self.n_classes))
-                possible_labels.remove(el)
-                not_y.append(np.random.choice(possible_labels))
-            not_y = torch.Tensor(not_y).long().to(y.device)
-            return one_hot(not_y, self.n_classes)
 
     def training_step(self, I, batch_idx):
         X, _, y_true = self._unpack_input(I)
 
         y_preds = self.forward(X)
 
-        loss = self.cross_entropy(y_preds.squeeze(), y_true.float().argmax(dim=-1))
+        if self.n_classes > 1:
+            loss = self.cross_entropy(y_preds.squeeze(), y_true.float().argmax(dim=-1))
+        else:
+            loss = self.cross_entropy(y_preds.squeeze(),  y_true.float())
         task_accuracy = roc_auc_score(y_true.squeeze().cpu(), y_preds.cpu().detach())
         print(f'Epoch {self.current_epoch}: task accuracy: {task_accuracy:.4f}')
         return loss
@@ -118,7 +95,10 @@ class NeuralNet(pl.LightningModule):
     def validation_step(self, I, batch_idx):
         X, _, y_true = self._unpack_input(I)
         y_preds = self.forward(X)
-        loss = self.cross_entropy(y_preds.squeeze(), y_true.float().argmax(dim=-1))
+        if self.n_classes > 1:
+            loss = self.cross_entropy(y_preds.squeeze(), y_true.float().argmax(dim=-1))
+        else:
+            loss = self.cross_entropy(y_preds.squeeze(),  y_true.float())
         val_acc = roc_auc_score(y_true.cpu(), y_preds.cpu().detach())
         self.log("val_acc", val_acc)
         return loss
@@ -129,8 +109,8 @@ class NeuralNet(pl.LightningModule):
 
 
 class StandardE2E(NeuralNet):
-    def __init__(self, input_features: int, n_classes: int, emb_size: int, learning_rate: float = 0.01):
-        super().__init__(input_features, n_classes, emb_size, learning_rate)
+    def __init__(self, input_features: int, n_classes: int, emb_size: int, learning_rate: float = 0.01, pos_weight=None):
+        super().__init__(input_features, n_classes, emb_size, learning_rate, pos_weight=pos_weight)
         self.model = torch.nn.Sequential(
             torch.nn.Linear(input_features, emb_size),
             torch.nn.LeakyReLU(),
@@ -145,12 +125,11 @@ class StandardE2E(NeuralNet):
     def forward(self, X, explain=False):
         return self.model(X)
 
-
 class StandardCBM(StandardE2E):
     def __init__(self, input_features: int, n_concepts: int, n_classes: int, emb_size: int,
                  learning_rate: float = 0.01, concept_names: list = None, task_names: list = None,
-                 task_weight: float = 0.1, bool_concepts: bool = True, deep: bool = True):
-        super().__init__(input_features, n_classes, emb_size, learning_rate)
+                 task_weight: float = 0.1, bool_concepts: bool = True, deep: bool = True, pos_weight=None):
+        super().__init__(input_features, n_classes, emb_size, learning_rate, pos_weight=pos_weight)
         self.n_concepts = n_concepts
         self.concept_names = concept_names
         self.task_names = task_names
@@ -194,9 +173,9 @@ class StandardCBM(StandardE2E):
         c_preds, y_preds, _ = self.forward(X)
 
         concept_loss = self.classification_loss(c_preds, c_true.float())
-        try:
+        if self.n_classes > 1:
             task_loss = self.cross_entropy(y_preds, y_true.float().argmax(dim=-1))
-        except:
+        else:
             task_loss = self.cross_entropy(y_preds,  y_true.float())
         loss = concept_loss + self.task_weight*task_loss
 
@@ -217,37 +196,29 @@ class StandardCBM(StandardE2E):
             c_preds = torch.sigmoid(c_preds)
 
         concept_loss = self.classification_loss(c_preds, c_true.float())
-        try:
+        if self.n_classes > 1:
             task_loss = self.cross_entropy(y_preds, y_true.float().argmax(dim=-1))
-        except:
+        else:
             task_loss = self.cross_entropy(y_preds,  y_true.float())
         loss = concept_loss + self.task_weight*task_loss
         val_acc = (roc_auc_score(y_true.cpu(), y_preds.cpu()) + roc_auc_score(c_true.cpu(), c_preds.cpu())) / 2
         self.log("val_acc", val_acc)
         return loss
 
-
-# write function to rescale a tensor A in [0, 1] to [vmin, vmax] where vmin and vmax are the min and max values of another tensor B
-def rescale(A, B):
-    return A * (0.5*B.max() - 0.5*B.min()) + 0.5*B.min()
-
-
 class CounterfactualCBM_V3(StandardCBM):
     def __init__(self, input_features: int, n_concepts: int, n_classes: int, emb_size: int, concept_set: torch.Tensor, concept_labels: torch.Tensor,
                  shield: torch.Tensor = None, train_intervention: bool = False,
                  learning_rate: float = 0.01, concept_names: list = None, task_names: list = None,
                  task_weight: float = 0.1, bool_concepts: bool = False, deep: bool = True, reconstruction=False, dataset='dsprites',
-                 bool_cf=False, resample: int = 0, bernulli: bool = False):
+                 bool_cf=False, resample: int = 0, bernulli: bool = False, pos_weight=None):
         if bool_cf:
             bool_concepts = True
         bool_concepts = True
-        super().__init__(input_features, n_concepts, n_classes, emb_size, learning_rate, concept_names, task_names, task_weight, bool_concepts, deep)
-        
-        self.bernulli = bernulli
+        super().__init__(input_features, n_concepts, n_classes, emb_size, learning_rate, concept_names, task_names, task_weight, bool_concepts, deep, pos_weight=pos_weight)
+
         self.dataset = dataset
         self.concept_list = concept_set
         self.concept_set = set([tuple(el) for el in self.concept_list.cpu().detach().numpy()])
-        self.concept_labels = concept_labels
         self.resample = resample
         self.encoder = torch.nn.Sequential(torch.nn.Linear(input_features, emb_size), torch.nn.LeakyReLU(), torch.nn.Linear(emb_size, emb_size), torch.nn.LeakyReLU())
         self.concept_mean_predictor = torch.nn.Sequential(torch.nn.Linear(emb_size, emb_size), torch.nn.LeakyReLU(), torch.nn.Linear(emb_size, emb_size))
@@ -264,12 +235,8 @@ class CounterfactualCBM_V3(StandardCBM):
         else:
             self.reasoner = torch.nn.Sequential(torch.nn.Linear(n_concepts, n_classes))
 
-        self.shield = shield
-        self.train_intervention = train_intervention
         self.classification_loss = self.bce if bool_concepts else self.bce_log
         self.classification_threshold = 0.5 if bool_concepts else 0
-        self.reconstruction = reconstruction
-        self.bool_cf = bool_cf
         
     def _predict_concepts(self, embeddings, predictor):
         c_preds = predictor(embeddings)
@@ -394,7 +361,6 @@ class CounterfactualCBM_V3(StandardCBM):
 
         c_prime_pred = torch.sigmoid(self.concept_predictor(z3)*4)
 
-
         y_cf_pred = self._predict_task(c_prime_pred, h)
 
         if resample > 1:
@@ -411,105 +377,8 @@ class CounterfactualCBM_V3(StandardCBM):
                 return y_cf_pred, c_prime_pred, c_pred
             return y_cf_pred, c_prime_pred
 
-        return y_cf_pred
-
-    def extract_counterfactual_explanation(self, y_preds, class_id, c_preds, c_cf, embeddings):
-        if not self.bool_concepts:
-            y_preds = torch.sigmoid(y_preds)
-            c_preds = torch.sigmoid(c_preds)
-        class_mask = y_preds[:, class_id] > self.classification_threshold
-        c_preds_class = (c_preds[class_mask] > self.classification_threshold).int()
-        c_preds_class_cf = (c_cf[class_mask] > self.classification_threshold).int()
-        return c_preds_class, c_preds_class_cf
+        return y_cf_pred   
     
-    def sample_again(self, cf_pred, pcprime_z3, y_pred, y_target, counter):
-        if counter == 0:
-            return cf_pred
-        filter = []
-        cf_pred_clone = cf_pred.clone().cpu().detach().numpy()
-        for i in range(cf_pred_clone.shape[0]):
-            if tuple(cf_pred_clone[i].astype(int)) in self.concept_set and y_pred[i].argmax() == y_target[i].argmax():
-                filter += [False]
-            else:
-                filter += [True]
-        filter = torch.Tensor(filter).bool()
-        new_samples = sample_bernoulli(pcprime_z3)
-        cf_pred[filter] = new_samples[filter]
-        return cf_pred, filter
-    
-    def sample_again_z(self, cf_pred, qz3, y_pred, y_target, counter):
-        if counter == 0:
-            return cf_pred
-        filter = []
-        cf_pred_clone = (cf_pred > 0.5).float().clone().cpu().detach().numpy()
-        for i in range(cf_pred_clone.shape[0]):
-            if tuple(cf_pred_clone[i].astype(int)) in self.concept_set and y_pred[i].argmax() == y_target[i].argmax():
-                filter += [False]
-            else:
-                filter += [True]
-        filter = torch.Tensor(filter).bool()
-        new_samples = qz3.rsample()
-        new_cf = torch.sigmoid(self.concept_predictor(new_samples))
-        cf_pred[filter] = new_cf[filter]
-        return cf_pred, filter, new_samples
-
-    
-    def check_overscribed_not_ind(self, c_pred, c_pred_init, z3, z3_init):
-        filter = []
-        cf_pred_clone = (c_pred > 0.5).float().clone().cpu().detach().numpy()
-        for i in range(cf_pred_clone.shape[0]):
-            if tuple(cf_pred_clone[i].astype(int)) in self.concept_set:
-                filter += [False]
-            else:
-                filter += [True]
-        filter = torch.Tensor(filter).bool()
-        print(filter.sum())
-        c_pred[filter] = c_pred_init[filter]
-        z3[filter] = z3_init[filter]
-        return c_pred, z3
-    
-    def select_cf(self, c_cf, c, y_cf, y_target):
-        filter = y_cf.argmax(dim=-1) == y_target.argmax(dim=-1)
-        filter[0, :] = True
-        print(filter.shape)
-        right_cf = c_cf[filter]
-        print(right_cf.shape)
-        weights = torch.abs(filter.float()-1).sum(dim=-1)
-        return right_cf[0, :, :]
-    
-    def dont_change(self, c_prime_pred, c_pred):
-        changes = torch.abs((c_prime_pred > 0.5).float() - (c_pred > 0.5).float())
-        c_prime_pred_tmp = c_prime_pred*changes + c_pred*(1-changes)
-        changes = (torch.abs(c_prime_pred - c_pred) < 0.01).float()
-        c_prime_pred = c_prime_pred*changes + c_prime_pred_tmp*(1-changes)
-        return c_prime_pred
-
-    def filter_y_c(self, y_pred, c_pred, z2):
-        
-        y_pred_argmax = y_pred.argmax(dim=-1).T.detach().numpy()
-
-        def extract_most_freq(x):
-            unique, count = np.unique(x, return_counts=True)
-            index = np.argmax(count)
-            result = unique[index]
-            return result
-        def extract_highest_sum(x):
-            sum = np.sum(x, axis=0)
-            result = np.argmax(sum, axis=-1)
-            return result
-
-        # index = extract_highest_sum(y_pred.detach().numpy())
-        index = np.apply_along_axis(extract_most_freq, arr=y_pred_argmax, axis=-1)
-        index = torch.Tensor(index)
-
-        y_pred_argmax_index = y_pred.argmax(dim=-1).eq(index).float().argmax(dim=0).squeeze(0)
-
-        y_pred_selected = y_pred[y_pred_argmax_index, list(range(y_pred.shape[1])), :]
-        c_pred_selected = c_pred[y_pred_argmax_index, list(range(y_pred.shape[1])), :]
-        z2_selected = z2[y_pred_argmax_index, list(range(y_pred.shape[1])), :]
-
-        return y_pred_selected, c_pred_selected, z2_selected
-
     def forward(self, X, c=None, c_cf=None, y_prime=None, explain=False, explanation_mode='local', auto_intervention=0, test=False, y_true=None, include=True, resample=1, inference=False):
         if auto_intervention > 0 and y_true is not None:
             X = torch.cat((X, X[:int(y_true.shape[0])]))
@@ -530,24 +399,18 @@ class CounterfactualCBM_V3(StandardCBM):
         p_z2 = torch.distributions.Normal(torch.zeros_like(qz2_x.mean), torch.ones_like(qz2_x.mean))
 
         # p(y|c)
-        if self.bernulli:
-            if test:
-                py_c = torch.distributions.Bernoulli(logits = self.reasoner(c_pred))
-            else:
-                py_c = torch.distributions.Bernoulli(logits = self.reasoner(c.float()))
+        py_c = None
+        if test:
             y_pred = self._predict_task(c_pred, h)
         else:
-            py_c = None
-            if test:
-                y_pred = self._predict_task(c_pred, h)
-            else:
-                y_pred = self._predict_task(c.float(), h)
+            y_pred = self._predict_task(c.float(), h)
 
         if y_prime is None:
             if y_pred.shape[-1] == 1:
                 y_prime = 1 - (y_pred > 0).float()
             else:
                 y_prime = self.randomize_class((y_pred).float(), include=include)
+        
         if auto_intervention > 0 and y_true is not None:
             # flip auto_intervention percentage of c_pred
             # index to flip
@@ -561,8 +424,7 @@ class CounterfactualCBM_V3(StandardCBM):
             c_pred = torch.cat((c_pred, c_pred_inv), dim=0)
             y_prime = y_prime[:-int(y_true.shape[0])]
             y_prime = torch.cat((y_prime, y_prime_inv), dim=0)
-            
-
+        
         # q(z3|z2, c, y, y')
         z2_c_y_y_prime = torch.cat((z2, c_pred, y_pred, y_prime), dim=1)
         z3_mu = self.concept_mean_qz3_predictor(z2_c_y_y_prime)
@@ -578,26 +440,15 @@ class CounterfactualCBM_V3(StandardCBM):
         pcprime_z3 = torch.distributions.Bernoulli(logits=self.concept_predictor(z3))
         c_prime_pred = torch.sigmoid(self.concept_predictor(z3)*4)
 
-        oracle = Oracle()
         if c is not None:
             c_cf = c
 
         # p(y'|c')
-        if self.bernulli:
-            if test:
-                py_c_cf = torch.distributions.Bernoulli(logits = self.reasoner(c_prime_pred))
-            else:
-                py_c_cf = torch.distributions.Bernoulli(logits = self.reasoner(c_cf.float())) #TODO c or c_pred?
-            # y_cf_pred = py_c_cf.sample()
-            # y_cf_pred = sample_bernoulli(py_c_cf)
+        if test:
             y_cf_pred = self._predict_task(c_prime_pred, h)
         else:
-            if test:
-                y_cf_pred = self._predict_task(c_prime_pred, h)
-            else:
-                y_cf_pred = self._predict_task(c_cf.float(), h)
-            py_c_cf = None
-
+            y_cf_pred = self._predict_task(c_cf.float(), h)
+        py_c_cf = None
 
         weights = torch.ones(c_prime_pred.shape[0])
 
@@ -610,11 +461,7 @@ class CounterfactualCBM_V3(StandardCBM):
 
         # extract explanations
         explanation, explanation_cf = {}, {}
-        if explain:
-            for class_id in range(self.n_classes):
-                c_preds_explanation, c_preds_explanation_cf = self.extract_counterfactual_explanation(y_pred, class_id, c_pred, c_prime_pred, h)
-                explanation_cf[class_id] = {'explanation': c_preds_explanation, 'counterfactual': c_preds_explanation_cf}
-
+    
         return c_pred, y_pred, explanation, c_prime_pred, y_cf_pred, y_prime, explanation_cf, p_z2, qz2_x, pz3_z2_c_y, qz3_z2_c_y_y_prime, pcprime_z3, py_c, py_c_cf, pc_z2, c_cf, weights, z2, z3, None
     
     def training_step(self, I, batch_idx):
@@ -622,28 +469,13 @@ class CounterfactualCBM_V3(StandardCBM):
             self.epoch += 1
         X, c_true, y_true = self._unpack_input(I)
         self.actual_resample = 0
-        if self.reconstruction:
-            intervention_list = [0.1, 0.2, 0.5]
-            # random int between 0 and 2
-            rand_int = random.randint(0,2)
-            p = intervention_list[rand_int]
-        else:
-            p = 0
+        p = 0
         (c_pred, y_pred, explanation,
          c_prime, y_cf, y_prime, explanation_cf, 
          p_z2, qz2_x, pz3_z2_c_y, qz3_z2_c_y_y_prime,
          pcprime_z3, py_c, py_c_cf, pc_z2, c_cf, weights, z2, z3, _) = self.forward(X, c_true, y_true=y_true[:int(X.shape[0]*0.2)], test=True, auto_intervention=p)
         int_concept_loss, int_task_loss = 0, 0
         int_concept_accuracy, int_task_accuracy = 0, 0
-
-        if self.reconstruction:
-            z2 = z2[:-int(X.shape[0]*0.2)]
-            z3 = z3[:-int(X.shape[0]*0.2)]
-            c_true = torch.cat((c_true, c_true[:int(X.shape[0]*0.2)]), dim=0)
-            c_prime_int = c_prime[-int(X.shape[0]*0.2):]
-            c_prime = c_prime[:-int(X.shape[0]*0.2)]
-            y_pred = y_pred[:-int(X.shape[0]*0.2)]
-            c_pred = c_pred[:-int(X.shape[0]*0.2)]
 
         # compute loss
 
@@ -660,36 +492,16 @@ class CounterfactualCBM_V3(StandardCBM):
         dist_loss = torch.norm(z2 - z3, p=2, dim=1).mean()
         hamming_loss = torch.abs(torch.norm((c_pred > 0.5).float() - (c_prime > 0.5).float(), p=0, dim=-1)).mean()
 
-        if self.reconstruction:
-            reconstruction_loss = self.bce_log(c_prime_int, c_true[:int(X.shape[0]*0.2)].float())
-            print(reconstruction_loss)
+        if self.n_classes > 1:
+            task_loss = self.cross_entropy(y_pred, y_true.float().argmax(dim=-1))
+            task_loss_cf = self.cross_entropy(y_cf, y_prime.float().argmax(dim=-1))
         else:
-            reconstruction_loss = 0
-
-        # E_{c' ~ q(c'|c,y')}[-log p(c'|c))
-        # admissibility_cf = torch.mean(- pcprime_z3.log_prob(c_cf.float()))
-        admissibility_cf = 0
-
-        if self.bernulli:
-            # -log(p(y|c))
-            task_loss = torch.mean(- py_c.log_prob(y_true.float()))
-            # E_{c' ~ q(c'|c,y')}[ -log(p(y'|c'))]
-            task_loss_cf = torch.mean(- py_c_cf.log_prob(y_prime.float()))
-        else:
-            try:
-                task_loss = self.cross_entropy(y_pred, y_true.float().argmax(dim=-1))
-                task_loss_cf = self.cross_entropy(y_cf, y_prime.float().argmax(dim=-1))
-            except:
-                task_loss = self.cross_entropy(y_pred, y_true.float())
-                task_loss_cf = self.cross_entropy(y_cf, y_prime.float())
+            task_loss = self.cross_entropy(y_pred, y_true.float())
+            task_loss_cf = self.cross_entropy(y_cf, y_prime.float())
 
         # E_{c' ~ q(z2 | x)}[-log(p(c|z2))]
         concept_loss = self.bce(c_pred, c_true.float())
-        # loss = torch.nn.MSELoss()
-        # concept_loss = loss(c_pred, c_true.float())
-        # concept_loss = torch.mean(- pc_z2.log_prob(c_true.float()))
-        # concept_loss = torch.mean(- p_z2.log_prob(c_true.float()))
-
+        
         task_accuracy = roc_auc_score(y_true.squeeze().cpu(), y_pred.squeeze().cpu().detach())
         c_true = c_true[:int(c_pred.shape[0])]
         concept_accuracy = roc_auc_score(c_true.cpu(), c_pred.squeeze().cpu().detach())
@@ -698,7 +510,6 @@ class CounterfactualCBM_V3(StandardCBM):
             task_cf_accuracy = roc_auc_score(y_prime.squeeze().cpu(), y_cf.squeeze().cpu().detach(), average='micro')
         except:
             task_cf_accuracy = 0
-
         
         # dsprites loss
         if self.dataset == 'dsprites':
@@ -712,7 +523,6 @@ class CounterfactualCBM_V3(StandardCBM):
         # mnist loss 
         else:
             loss = 1*task_loss + 10*concept_loss + 0.2*task_loss_cf + 2*(kl_loss_z2  + kl_loss_z3) + 1.7*kl_loss_dist + 0.55*dist_loss # + reconstruction_loss # + 0.0*hamming_loss + 0*kl_q_dist # + 2*admissibility_cf  
-          
         return loss
 
     def validation_step(self, I, batch_idx):
@@ -724,15 +534,6 @@ class CounterfactualCBM_V3(StandardCBM):
          c_prime, y_cf, y_prime, explanation_cf, 
          p_z2, qz2_x, pz3_z2_c_y, qz3_z2_c_y_y_prime,
          pcprime_z3, py_c, py_c_cf, pc_z2, c_cf, weights, z2, z3, _) = self.forward(X, test=True)
-
-        if self.reconstruction:
-            z2 = z2[:-int(X.shape[0]*0.2)]
-            z3 = z3[:-int(X.shape[0]*0.2)]
-            c_true = torch.cat((c_true, c_true[:int(X.shape[0]*0.2)]), dim=0)
-            c_prime_int = c_prime[-int(X.shape[0]*0.2):]
-            c_prime = c_prime[:-int(X.shape[0]*0.2)]
-            y_pred = y_pred[:-int(X.shape[0]*0.2)]
-            c_pred = c_pred[:-int(X.shape[0]*0.2)]
 
         # compute loss
 
@@ -749,45 +550,29 @@ class CounterfactualCBM_V3(StandardCBM):
         dist_loss = torch.norm(z2 - z3, p=2, dim=1).mean()
         hamming_loss = torch.abs(torch.norm((c_pred > 0.5).float() - (c_prime > 0.5).float(), p=0, dim=-1)).mean()
 
-        if self.reconstruction:
-            reconstruction_loss = self.bce_log(c_prime_int, c_true[:int(X.shape[0]*0.2)].float())
+        if self.n_classes > 1:
+            task_loss = self.cross_entropy(y_pred, y_true.float().argmax(dim=-1))
+            task_loss_cf = self.cross_entropy(y_cf, y_prime.float().argmax(dim=-1))
         else:
-            reconstruction_loss = 0
-
-        # E_{c' ~ q(c'|c,y')}[-log p(c'|c))
-        # admissibility_cf = torch.mean(- pcprime_z3.log_prob(c_cf.float()))
-        admissibility_cf = 0
-
-        if self.bernulli:
-            # -log(p(y|c))
-            task_loss = torch.mean(- py_c.log_prob(y_true.float()))
-            # E_{c' ~ q(c'|c,y')}[ -log(p(y'|c'))]
-            task_loss_cf = torch.mean(- py_c_cf.log_prob(y_prime.float()))
-        else:
-            try:
-                task_loss = self.cross_entropy(y_pred, y_true.float().argmax(dim=-1))
-                task_loss_cf = self.cross_entropy(y_cf, y_prime.float().argmax(dim=-1))
-            except:
-                task_loss = self.cross_entropy(y_pred, y_true.float())
-                task_loss_cf = self.cross_entropy(y_cf, y_prime.float())
+            task_loss = self.cross_entropy(y_pred, y_true.float())
+            task_loss_cf = self.cross_entropy(y_cf, y_prime.float())
 
         # E_{c' ~ q(z2 | x)}[-log(p(c|z2))]
-        # concept_loss = self.bce(c_pred, c_true.float())
-        concept_loss = torch.mean(- pc_z2.log_prob(c_true.float()))
-        # concept_loss = torch.mean(- p_z2.log_prob(c_true.float()))
-
-
+        concept_loss = self.bce(c_pred, c_true.float())
         
         # dsprites loss
-        #loss = 0.7*task_loss + 10*concept_loss + 0.3*task_loss_cf + 1.2*(kl_loss_z2  + kl_loss_z3) + 1.0*kl_loss_dist + 0.5*dist_loss + 0.0*hamming_loss + 0*kl_q_dist # + 2*admissibility_cf 
-        # # mnist loss 
-        # if self.reconstruction:
-        #     loss = 0.7*task_loss + 10*concept_loss + 0.2*task_loss_cf + 2*(kl_loss_z2  + kl_loss_z3) + 2.0*kl_loss_dist + 0.55*dist_loss + reconstruction_loss # + 0.0*hamming_loss + 0*kl_q_dist # + 2*admissibility_cf 
-        # else:
-        #     # loss = 0.7*task_loss + 10*concept_loss + 0.2*task_loss_cf + 0.9*(kl_loss_z2  + kl_loss_z3) + 1*kl_loss_dist + 0.63*dist_loss + reconstruction_loss # + 0.0*hamming_loss + 0*kl_q_dist # + 2*admissibility_cf 
-        loss = 1*task_loss + 10*concept_loss + 0.2*task_loss_cf + 2*(kl_loss_z2  + kl_loss_z3) + 1.5*kl_loss_dist + 0.4*dist_loss # + reconstruction_loss # + 0.0*hamming_loss + 0*kl_q_dist # + 2*admissibility_cf 
-        #     # loss = 1*task_loss + 10*concept_loss + 0.15*task_loss_cf + 1*kl_loss_z2  + 3*kl_loss_z3 + 2*kl_loss_dist + 0.0*dist_loss # + 0.0*hamming_loss + 0*kl_q_dist # + 2*admissibility_cf 
-              
+        if self.dataset == 'dsprites':
+            if self.deep:
+                loss = 0.7*task_loss + 10*concept_loss + 0.3*task_loss_cf + 1.2*(kl_loss_z2  + kl_loss_z3) + 1.0*kl_loss_dist + 0.6*dist_loss + 0.0*hamming_loss + 0*kl_q_dist # + 2*admissibility_cf
+            else:
+                if y_pred.shape[-1] == 1:
+                    loss = 0.7*task_loss + 10*concept_loss + 0.5*task_loss_cf + 1.2*(kl_loss_z2  + kl_loss_z3) + 1.0*kl_loss_dist + 0.35*dist_loss + 0.0*hamming_loss + 0*kl_q_dist # + 2*admissibility_cf 
+                else:
+                    loss = 0.7*task_loss + 10*concept_loss + 0.5*task_loss_cf + 1.2*(kl_loss_z2  + kl_loss_z3) + 1.0*kl_loss_dist + 0.5*dist_loss + 0.0*hamming_loss + 0*kl_q_dist # + 2*admissibility_cf 
+        # mnist loss 
+        else:
+            loss = 1*task_loss + 10*concept_loss + 0.2*task_loss_cf + 2*(kl_loss_z2  + kl_loss_z3) + 1.7*kl_loss_dist + 0.55*dist_loss # + reconstruction_loss # + 0.0*hamming_loss + 0*kl_q_dist # + 2*admissibility_cf  
+               
 
         task_accuracy = roc_auc_score(y_true.squeeze().cpu(), y_pred.squeeze().cpu().detach())
         concept_accuracy = roc_auc_score(c_true.cpu(), c_pred.squeeze().cpu().detach())
@@ -812,10 +597,6 @@ class CounterfactualCBM_V3_1(StandardCBM):
         bool_concepts = True
         super().__init__(input_features, n_concepts, n_classes, emb_size, learning_rate, concept_names, task_names, task_weight, bool_concepts, deep)
         
-        self.bernulli = bernulli
-        self.concept_list = concept_set
-        self.concept_set = set([tuple(el) for el in self.concept_list.cpu().detach().numpy()])
-        self.concept_labels = concept_labels
         self.resample = resample
         self.encoder = torch.nn.Sequential(torch.nn.Linear(input_features, emb_size), torch.nn.LeakyReLU(), torch.nn.Linear(emb_size, emb_size), torch.nn.LeakyReLU())
         self.concept_mean_predictor = torch.nn.Sequential(torch.nn.Linear(input_features, emb_size), torch.nn.LeakyReLU(), torch.nn.Linear(emb_size, emb_size))
@@ -831,11 +612,8 @@ class CounterfactualCBM_V3_1(StandardCBM):
         else:
             self.reasoner = torch.nn.Sequential(torch.nn.Linear(n_concepts, n_classes))
 
-        self.shield = shield
-        self.train_intervention = train_intervention
         self.classification_loss = self.bce if bool_concepts else self.bce_log
         self.classification_threshold = 0.5 if bool_concepts else 0
-        self.reconstruction = reconstruction
         self.bool_cf = bool_cf
         
     def _predict_concepts(self, embeddings, predictor):
@@ -967,8 +745,8 @@ class CounterfactualCBM_V3_1(StandardCBM):
         if resample > 1:
             c_prime_pred, y_cf_pred = self.filter_counterfactuals(c_prime_pred, c_pred_d, y_cf_pred, y_prime, z3, qz3_z2_c_y_y_prime)  
             y_cf_pred = self._predict_task(c_prime_pred, h)
-        # else:
-        #     y_cf_pred = y_cf_pred.squeeze(0)
+        else:
+            y_cf_pred = y_cf_pred.squeeze(0)
 
         if auto_intervention > 0:
             return y_cf_pred, c_prime_pred, y_pred, c_pred
@@ -979,103 +757,6 @@ class CounterfactualCBM_V3_1(StandardCBM):
             return y_cf_pred, c_prime_pred
 
         return y_cf_pred
-
-    def extract_counterfactual_explanation(self, y_preds, class_id, c_preds, c_cf, embeddings):
-        if not self.bool_concepts:
-            y_preds = torch.sigmoid(y_preds)
-            c_preds = torch.sigmoid(c_preds)
-        class_mask = y_preds[:, class_id] > self.classification_threshold
-        c_preds_class = (c_preds[class_mask] > self.classification_threshold).int()
-        c_preds_class_cf = (c_cf[class_mask] > self.classification_threshold).int()
-        return c_preds_class, c_preds_class_cf
-    
-    def sample_again(self, cf_pred, pcprime_z3, y_pred, y_target, counter):
-        if counter == 0:
-            return cf_pred
-        filter = []
-        cf_pred_clone = cf_pred.clone().cpu().detach().numpy()
-        for i in range(cf_pred_clone.shape[0]):
-            if tuple(cf_pred_clone[i].astype(int)) in self.concept_set and y_pred[i].argmax() == y_target[i].argmax():
-                filter += [False]
-            else:
-                filter += [True]
-        filter = torch.Tensor(filter).bool()
-        new_samples = sample_bernoulli(pcprime_z3)
-        cf_pred[filter] = new_samples[filter]
-        return cf_pred, filter
-    
-    def sample_again_z(self, cf_pred, qz3, y_pred, y_target, counter):
-        if counter == 0:
-            return cf_pred
-        filter = []
-        cf_pred_clone = (cf_pred > 0.5).float().clone().cpu().detach().numpy()
-        for i in range(cf_pred_clone.shape[0]):
-            if tuple(cf_pred_clone[i].astype(int)) in self.concept_set and y_pred[i].argmax() == y_target[i].argmax():
-                filter += [False]
-            else:
-                filter += [True]
-        filter = torch.Tensor(filter).bool()
-        new_samples = qz3.rsample()
-        new_cf = torch.sigmoid(self.concept_predictor(new_samples))
-        cf_pred[filter] = new_cf[filter]
-        return cf_pred, filter, new_samples
-
-    
-    def check_overscribed_not_ind(self, c_pred, c_pred_init, z3, z3_init):
-        filter = []
-        cf_pred_clone = (c_pred > 0.5).float().clone().cpu().detach().numpy()
-        for i in range(cf_pred_clone.shape[0]):
-            if tuple(cf_pred_clone[i].astype(int)) in self.concept_set:
-                filter += [False]
-            else:
-                filter += [True]
-        filter = torch.Tensor(filter).bool()
-        print(filter.sum())
-        c_pred[filter] = c_pred_init[filter]
-        z3[filter] = z3_init[filter]
-        return c_pred, z3
-    
-    def select_cf(self, c_cf, c, y_cf, y_target):
-        filter = y_cf.argmax(dim=-1) == y_target.argmax(dim=-1)
-        filter[0, :] = True
-        print(filter.shape)
-        right_cf = c_cf[filter]
-        print(right_cf.shape)
-        weights = torch.abs(filter.float()-1).sum(dim=-1)
-        return right_cf[0, :, :]
-    
-    def dont_change(self, c_prime_pred, c_pred):
-        changes = torch.abs((c_prime_pred > 0.5).float() - (c_pred > 0.5).float())
-        c_prime_pred_tmp = c_prime_pred*changes + c_pred*(1-changes)
-        changes = (torch.abs(c_prime_pred - c_pred) < 0.01).float()
-        c_prime_pred = c_prime_pred*changes + c_prime_pred_tmp*(1-changes)
-        return c_prime_pred
-
-    def filter_y_c(self, y_pred, c_pred, z2):
-        
-        y_pred_argmax = y_pred.argmax(dim=-1).T.detach().numpy()
-
-        def extract_most_freq(x):
-            unique, count = np.unique(x, return_counts=True)
-            index = np.argmax(count)
-            result = unique[index]
-            return result
-        def extract_highest_sum(x):
-            sum = np.sum(x, axis=0)
-            result = np.argmax(sum, axis=-1)
-            return result
-
-        # index = extract_highest_sum(y_pred.detach().numpy())
-        index = np.apply_along_axis(extract_most_freq, arr=y_pred_argmax, axis=-1)
-        index = torch.Tensor(index)
-
-        y_pred_argmax_index = y_pred.argmax(dim=-1).eq(index).float().argmax(dim=0).squeeze(0)
-
-        y_pred_selected = y_pred[y_pred_argmax_index, list(range(y_pred.shape[1])), :]
-        c_pred_selected = c_pred[y_pred_argmax_index, list(range(y_pred.shape[1])), :]
-        z2_selected = z2[y_pred_argmax_index, list(range(y_pred.shape[1])), :]
-
-        return y_pred_selected, c_pred_selected, z2_selected
 
     def forward(self, X, c=None, c_cf=None, y_prime=None, explain=False, explanation_mode='local', auto_intervention=0, test=False, y_true=None, include=True, resample=1, inference=False):
         if auto_intervention > 0 and y_true is not None:
@@ -1091,50 +772,20 @@ class CounterfactualCBM_V3_1(StandardCBM):
         else:
             z2 = qz2_x.rsample()
         # p(c|z2)
-        # pc_z2 = torch.distributions.Bernoulli(logits=self.concept_predictor(z2)*4)
         pc_z2 = torch.distributions.Bernoulli(logits=torch.zeros(self.concept_predictor(z2).shape))
-        # pc_z2 = torch.distributions.ContinuousBernoulli(logits=self.concept_predictor(z2))
-        # c_pred = pc_z2.rsample()
-        # c_pred = sample_bernoulli(pc_z2)
+        
         c_pred_d = torch.sigmoid(self.concept_predictor(z2)*4)
         c_pred = torch.sigmoid(self.concept_predictor(h)*4)
-
-        # if self.actual_resample > 0:
-        #     c_pred_init = c_pred
-        #     resample = self.actual_resample
-        #     n_errors = -1
-        #     while resample != 0 and n_errors != 0:
-        #         c_pred, errors = self.sample_again(c_pred, pc_z2, resample)
-        #         resample -= 1
-        #         n_errors = errors.sum()
-        #     print(errors.sum())
-        #     c_pred = self.check_overscribed_not_ind(c_pred, c_pred_init)
 
         # p(z2)
         p_z2 = torch.distributions.Normal(torch.zeros_like(qz2_x.mean), torch.ones_like(qz2_x.mean))
 
         # p(y|c)
-        if self.bernulli:
-            if test:
-                py_c = torch.distributions.Bernoulli(logits = self.reasoner(c_pred))
-            else:
-                py_c = torch.distributions.Bernoulli(logits = self.reasoner(c.float()))
-            # y_pred = py_c.sample()
-            # y_pred = sample_bernoulli(py_c)
+        py_c = None
+        if test:
             y_pred = self._predict_task(c_pred, h)
         else:
-            py_c = None
-            if test:
-                y_pred = self._predict_task(c_pred, h)
-            else:
-                y_pred = self._predict_task(c.float(), h)
-
-        # if resample > 1:
-        #     y_pred, c_pred, z2 = self.filter_y_c(y_pred, c_pred, z2)
-        # elif resample == 1:
-        #     y_pred = y_pred.squeeze(0)
-        #     c_pred = c_pred.squeeze(0)
-        #     z2 = z2.squeeze(0)
+            y_pred = self._predict_task(c.float(), h)
 
         if y_prime is None:
             y_prime = self.randomize_class((y_pred).float(), include=include)
@@ -1168,41 +819,18 @@ class CounterfactualCBM_V3_1(StandardCBM):
 
         # p(c'|z3)
         pcprime_z3 = torch.distributions.Bernoulli(logits=self.concept_predictor(z3))
-        # pcprime_z3 = None
-        # pcprime_z3 = torch.distributions.ContinuousBernoulli(logits=self.concept_predictor(z3)) # Continuous Bernoulli
-        # c_prime_pred = pcprime_z3.rsample()
-        # c_prime_pred = sample_bernoulli(pcprime_z3)
         c_prime_pred = torch.sigmoid(self.concept_predictor(z3)*4)
 
-        # c_prime_pred = self.dont_change(c_prime_pred, c_pred)
-
-        oracle = Oracle()
         if c is not None:
-            # _, c_cf = oracle.find_counterfactuals(c, y_pred, self.concept_list, self.concept_labels, y_prime)
-            # c_cf = c_cf.to(X.device)
             c_cf = c
+        
         # p(y'|c')
-
-        if self.bernulli:
-            if test:
-                py_c_cf = torch.distributions.Bernoulli(logits = self.reasoner(c_prime_pred))
-            else:
-                py_c_cf = torch.distributions.Bernoulli(logits = self.reasoner(c_cf.float())) #TODO c or c_pred?
-            # y_cf_pred = py_c_cf.sample()
-            # y_cf_pred = sample_bernoulli(py_c_cf)
+        if test:
             y_cf_pred = self._predict_task(c_prime_pred, h)
         else:
-            if test:
-                y_cf_pred = self._predict_task(c_prime_pred, h)
-            else:
-                y_cf_pred = self._predict_task(c_cf.float(), h)
-            py_c_cf = None
+            y_cf_pred = self._predict_task(c_cf.float(), h)
+        py_c_cf = None
         
-        # y_prime = y_prime.repeat(self.resample, 1, 1)
-        # c_prime_pred = self.select_cf(c_prime_pred, c_pred, y_cf_pred, y_prime)
-
-        # c_cf = self.explore(c_pred, y_prime, qz3_z2_c_y_y_prime, h)
-
         weights = torch.ones(c_prime_pred.shape[0])
 
         # p(z3|z2, c, y)
@@ -1214,10 +842,6 @@ class CounterfactualCBM_V3_1(StandardCBM):
 
         # extract explanations
         explanation, explanation_cf = {}, {}
-        if explain:
-            for class_id in range(self.n_classes):
-                c_preds_explanation, c_preds_explanation_cf = self.extract_counterfactual_explanation(y_pred, class_id, c_pred, c_prime_pred, h)
-                explanation_cf[class_id] = {'explanation': c_preds_explanation, 'counterfactual': c_preds_explanation_cf}
 
         return c_pred, y_pred, explanation, c_prime_pred, y_cf_pred, y_prime, explanation_cf, p_z2, qz2_x, pz3_z2_c_y, qz3_z2_c_y_y_prime, pcprime_z3, py_c, py_c_cf, pc_z2, c_cf, weights, z2, z3, c_pred_d
     
@@ -1227,41 +851,20 @@ class CounterfactualCBM_V3_1(StandardCBM):
         if self.epoch == 1000:
             for param in self.encoder.parameters():
                 param.requires_grad = False
-            # for param in self.concept_mean_predictor.parameters():
-            #     param.requires_grad = False
             for param in self.concept_predictor.parameters():
                 param.requires_grad = False
-            # for param in self.reasoner.parameters():
-            #     param.requires_grad = False
         X, c_true, y_true = self._unpack_input(I)
         # self.actual_resample = self.resample
         self.actual_resample = 0
-        if self.reconstruction:
-            intervention_list = [0.1, 0.2, 0.5]
-            # random int between 0 and 2
-            rand_int = random.randint(0,2)
-            p = intervention_list[rand_int]
-        else:
-            p = 0
-        if self.epoch > -1:
-            inference = False
-        else:
-            inference = True
+        p = 0
+        inference = False
+
         (c_pred, y_pred, explanation,
          c_prime, y_cf, y_prime, explanation_cf, 
          p_z2, qz2_x, pz3_z2_c_y, qz3_z2_c_y_y_prime,
          pcprime_z3, py_c, py_c_cf, pc_z2, c_cf, weights, z2, z3, c_pred_d) = self.forward(X, c_true, y_true=y_true[:int(X.shape[0]*0.2)], test=True, auto_intervention=p, inference=inference)
         int_concept_loss, int_task_loss = 0, 0
         int_concept_accuracy, int_task_accuracy = 0, 0
-
-        if self.reconstruction:
-            z2 = z2[:-int(X.shape[0]*0.2)]
-            z3 = z3[:-int(X.shape[0]*0.2)]
-            c_true = torch.cat((c_true, c_true[:int(X.shape[0]*0.2)]), dim=0)
-            c_prime_int = c_prime[-int(X.shape[0]*0.2):]
-            c_prime = c_prime[:-int(X.shape[0]*0.2)]
-            y_pred = y_pred[:-int(X.shape[0]*0.2)]
-            c_pred = c_pred[:-int(X.shape[0]*0.2)]
 
         # compute loss
 
@@ -1276,30 +879,13 @@ class CounterfactualCBM_V3_1(StandardCBM):
         kl_q_dist = torch.distributions.kl_divergence(qz2_x, qz3_z2_c_y_y_prime).mean()
 
         dist_loss = torch.norm(z2 - z3, p=2, dim=1).mean()
-        hamming_loss = torch.abs(torch.norm((c_pred > 0.5).float() - (c_prime > 0.5).float(), p=0, dim=-1)).mean()
 
-        if self.reconstruction:
-            reconstruction_loss = self.bce_log(c_prime_int, c_true[:int(X.shape[0]*0.2)].float())
-            print(reconstruction_loss)
-        else:
-            reconstruction_loss = 0
-
-        # E_{c' ~ q(c'|c,y')}[-log p(c'|c))
-        # admissibility_cf = torch.mean(- pcprime_z3.log_prob(c_cf.float()))
-        admissibility_cf = 0
-
-        if self.bernulli:
-            # -log(p(y|c))
-            task_loss = torch.mean(- py_c.log_prob(y_true.float()))
-            # E_{c' ~ q(c'|c,y')}[ -log(p(y'|c'))]
-            task_loss_cf = torch.mean(- py_c_cf.log_prob(y_prime.float()))
-        else:
-            try:
-                task_loss = self.cross_entropy(y_pred, y_true.float().argmax(dim=-1))
-                task_loss_cf = self.cross_entropy(y_cf, y_prime.float().argmax(dim=-1))
-            except:
-                task_loss = self.cross_entropy(y_pred, y_true.float())
-                task_loss_cf = self.cross_entropy(y_cf, y_prime.float())
+        try:
+            task_loss = self.cross_entropy(y_pred, y_true.float().argmax(dim=-1))
+            task_loss_cf = self.cross_entropy(y_cf, y_prime.float().argmax(dim=-1))
+        except:
+            task_loss = self.cross_entropy(y_pred, y_true.float())
+            task_loss_cf = self.cross_entropy(y_cf, y_prime.float())
 
         # E_{c' ~ q(z2 | x)}[-log(p(c|z2))]
         concept_loss = self.bce(c_pred, c_true.float())
@@ -1315,7 +901,7 @@ class CounterfactualCBM_V3_1(StandardCBM):
             task_cf_accuracy = 0
 
         
-        loss = self.task_weight*task_loss + 1*concept_loss + 1*concept_loss2 + 0.02*task_loss_cf + 0.2*(kl_loss_z2  + kl_loss_z3) + 0.2*kl_loss_dist + 0.03*dist_loss # + reconstruction_loss # + 0.0*hamming_loss + 0*kl_q_dist # + 2*admissibility_cf       
+        loss = self.task_weight*task_loss + 1*concept_loss + 1*concept_loss2 + 0.02*task_loss_cf + 0.2*(kl_loss_z2  + kl_loss_z3) + 0.2*kl_loss_dist + 0.03*dist_loss 
 
         return loss
 
@@ -1334,15 +920,6 @@ class CounterfactualCBM_V3_1(StandardCBM):
          p_z2, qz2_x, pz3_z2_c_y, qz3_z2_c_y_y_prime,
          pcprime_z3, py_c, py_c_cf, pc_z2, c_cf, weights, z2, z3, c_pred_d) = self.forward(X, test=True, inference=inference)
 
-        if self.reconstruction:
-            z2 = z2[:-int(X.shape[0]*0.2)]
-            z3 = z3[:-int(X.shape[0]*0.2)]
-            c_true = torch.cat((c_true, c_true[:int(X.shape[0]*0.2)]), dim=0)
-            c_prime_int = c_prime[-int(X.shape[0]*0.2):]
-            c_prime = c_prime[:-int(X.shape[0]*0.2)]
-            y_pred = y_pred[:-int(X.shape[0]*0.2)]
-            c_pred = c_pred[:-int(X.shape[0]*0.2)]
-
         # compute loss
 
         # KL( p(z2) || q(z2|x))
@@ -1356,35 +933,17 @@ class CounterfactualCBM_V3_1(StandardCBM):
         kl_q_dist = torch.distributions.kl_divergence(qz2_x, qz3_z2_c_y_y_prime).mean()
 
         dist_loss = torch.norm(z2 - z3, p=2, dim=1).mean()
-        hamming_loss = torch.abs(torch.norm((c_pred > 0.5).float() - (c_prime > 0.5).float(), p=0, dim=-1)).mean()
-
-        if self.reconstruction:
-            reconstruction_loss = self.bce_log(c_prime_int, c_true[:int(X.shape[0]*0.2)].float())
-        else:
-            reconstruction_loss = 0
-
-        # E_{c' ~ q(c'|c,y')}[-log p(c'|c))
-        # admissibility_cf = torch.mean(- pcprime_z3.log_prob(c_cf.float()))
-        admissibility_cf = 0
-
-        if self.bernulli:
-            # -log(p(y|c))
-            task_loss = torch.mean(- py_c.log_prob(y_true.float()))
-            # E_{c' ~ q(c'|c,y')}[ -log(p(y'|c'))]
-            task_loss_cf = torch.mean(- py_c_cf.log_prob(y_prime.float()))
-        else:
-            try:
-                task_loss = self.cross_entropy(y_pred, y_true.float().argmax(dim=-1))
-                task_loss_cf = self.cross_entropy(y_cf, y_prime.float().argmax(dim=-1))
-            except:
-                task_loss = self.cross_entropy(y_pred, y_true.float())
-                task_loss_cf = self.cross_entropy(y_cf, y_prime.float())
+    
+        try:
+            task_loss = self.cross_entropy(y_pred, y_true.float().argmax(dim=-1))
+            task_loss_cf = self.cross_entropy(y_cf, y_prime.float().argmax(dim=-1))
+        except:
+            task_loss = self.cross_entropy(y_pred, y_true.float())
+            task_loss_cf = self.cross_entropy(y_cf, y_prime.float())
 
         # E_{c' ~ q(z2 | x)}[-log(p(c|z2))]
-        # concept_loss = self.bce(c_pred, c_true.float())
-        concept_loss = torch.mean(- pc_z2.log_prob(c_true.float()))
-        # concept_loss = torch.mean(- p_z2.log_prob(c_true.float()))
-
+        concept_loss = self.bce(c_pred, c_true.float())
+        
         task_accuracy = roc_auc_score(y_true.squeeze().cpu(), y_pred.squeeze().cpu().detach())
         c_true = c_true[:int(c_pred.shape[0])]
         concept_accuracy = roc_auc_score(c_true.cpu(), c_pred.squeeze().cpu().detach())
@@ -1395,11 +954,10 @@ class CounterfactualCBM_V3_1(StandardCBM):
             task_cf_accuracy = 0
 
         
-        loss = 1*task_loss + 10*concept_loss + 0.2*task_loss_cf + 2*(kl_loss_z2  + kl_loss_z3) + 1.5*kl_loss_dist + 0.4*dist_loss # + reconstruction_loss # + 0.0*hamming_loss + 0*kl_q_dist # + 2*admissibility_cf  
+        loss = 1*task_loss + 10*concept_loss + 0.2*task_loss_cf + 2*(kl_loss_z2  + kl_loss_z3) + 1.5*kl_loss_dist + 0.4*dist_loss 
 
         task_accuracy = roc_auc_score(y_true.squeeze().cpu(), y_pred.squeeze().cpu().detach())
         concept_accuracy = roc_auc_score(c_true.cpu(), c_pred.squeeze().cpu().detach())
-        concept_accuracy2 = roc_auc_score(c_true.cpu(), c_pred_d.squeeze().cpu().detach())
         try:
             task_cf_accuracy = roc_auc_score(y_prime.squeeze().cpu(), y_cf.squeeze().cpu().detach(), average='micro')
         except:
@@ -1409,134 +967,24 @@ class CounterfactualCBM_V3_1(StandardCBM):
         self.log("val_acc", val_acc)
         return loss
 
-
-class StandardDCR(StandardCBM):
-    def __init__(self, input_features: int, n_concepts: int, n_classes: int, emb_size: int,
-                 learning_rate: float = 0.01, concept_names: list = None, task_names: list = None,
-                 temperature: float = 10, logic: Logic = ProductTNorm(), explanation_mode: str = 'local',
-                 task_weight: float = 0.1):
-        super().__init__(input_features, n_concepts, n_classes, emb_size, learning_rate, concept_names, task_names, task_weight)
-        self.temperature = temperature
-        self.logic = logic
-        self.explanation_mode = explanation_mode
-        self.reasoner = ConceptReasoningLayer(emb_size, n_concepts=n_concepts, logic=logic,
-                                              n_classes=n_classes, temperature=temperature)
-        self.cross_entropy = self.bce
-
-    def forward(self, X, explain=False, explanation_mode='global'):
-        embeddings = self.encoder(X)
-        c_preds = self.relation_classifiers(embeddings)
-        c_preds = torch.sigmoid(c_preds)
-        y_preds = self.reasoner(embeddings, c_preds)
-        explanation = None
-        if explain:
-            explanation = self.reasoner.explain(embeddings, c_preds, explanation_mode,
-                                                self.concept_names, self.task_names)
-        return c_preds, y_preds, explanation
-
-class CounterfactualDCR_V3(CounterfactualCBM_V3):
-    def __init__(self, input_features: int, n_concepts: int, n_classes: int, emb_size: int, concept_set: torch.Tensor, concept_labels: torch.Tensor,
-                 shield: torch.Tensor = None, train_intervention: bool = False,
-                 learning_rate: float = 0.01, concept_names: list = None, task_names: list = None,
-                 temperature: float = 10, logic: Logic = ProductTNorm(), explanation_mode: str = 'local',
-                 task_weight: float = 0.1, bool_concepts: bool = True, bool_cf: bool =False, resample: int = 0):
-        super().__init__(input_features, n_concepts, n_classes, emb_size, concept_set, concept_labels, shield, train_intervention,
-                         learning_rate, concept_names, task_names, task_weight, bool_concepts, False, False, bool_cf, resample)
-        
-        self.temperature = temperature
-        self.logic = logic
-        self.explanation_mode = explanation_mode
-        self.reasoner = ConceptReasoningLayer(emb_size, n_concepts=n_concepts, logic=logic,
-                                              n_classes=n_classes, temperature=temperature)
-        self.cross_entropy = torch.nn.NLLLoss()
-
-    def predict_counterfactuals(self, X, y_prime=None, resample=1, return_cf=False, auto_intervention=0, full=False):
-        h = self.encoder(X)
-        z2_mu = self.concept_mean_predictor(h)
-        z2_log_var = self.concept_var_predictor(h)
-        z2_sigma = torch.exp(z2_log_var / 2) + EPS
-        qz2_x = torch.distributions.Normal(z2_mu, z2_sigma)
-        z2 = qz2_x.rsample()
-
-        c_pred = torch.sigmoid(self.concept_predictor(z2)*4)
-
-        if auto_intervention > 0:
-            # flip auto_intervention percentage of c_pred
-            # index to flip
-            index = torch.randperm(c_pred.shape[1])[:int(math.ceil(auto_intervention*c_pred.shape[1]))]
-            # flip
-            c_pred[:, index] = 1 - c_pred[:, index]
-
-        y_pred = self._predict_task(c_pred, h)
-
-        if y_prime is None:
-            y_prime = self.randomize_class((y_pred).float())
-
-        # q(z3|z2, c, y, y')
-        z2_c_y_y_prime = torch.cat((z2, c_pred, y_pred, y_prime), dim=1)
-        z3_mu = self.concept_mean_qz3_predictor(z2_c_y_y_prime)
-        z3_log_var = self.concept_var_qz3_predictor(z2_c_y_y_prime)
-        z3_sigma = torch.exp(z3_log_var / 2) + EPS
-        qz3_z2_c_y_y_prime = torch.distributions.Normal(z3_mu, z3_sigma)
-        z3 = qz3_z2_c_y_y_prime.rsample(torch.Size([resample]))
-
-        c_prime_pred = torch.sigmoid(self.concept_predictor(z3)*4)
-
-
-        y_cf_pred = torch.empty((resample, c_pred.shape[0], self.n_classes))
-        for i in range(resample):
-            y_cf_pred_tmp = self._predict_task(c_prime_pred[i], h)
-            y_cf_pred[i] = y_cf_pred_tmp
-
-        c_prime_full = c_prime_pred.clone()
-        y_cf_pred_full = y_cf_pred.clone()
-
-        c_prime_pred, y_cf_pred = self.filter_counterfactuals(c_prime_pred, c_pred, y_cf_pred, y_prime, z3, qz3_z2_c_y_y_prime)
-
-        weights = torch.ones(c_prime_pred.shape[0])
-        
-        y_cf_pred = self._predict_task(c_prime_pred, h)
-
-        if auto_intervention > 0:
-            if full:
-                return y_cf_pred, c_prime_pred, y_pred, c_pred
-            return y_cf_pred, c_prime_pred, y_pred, c_pred
-
-        if return_cf:
-            return y_cf_pred, c_prime_pred
-
-        return y_cf_pred
-
-
-    def _predict_task(self, c, embeddings=None):
-        return torch.log(self.reasoner(embeddings, c))
-
-    def extract_counterfactual_explanation(self, y_preds, class_id, c_preds, c_cf, embeddings):
-        _, _, filter_attn = self.reasoner(embeddings.detach(), c_preds.detach(), return_attn=True)
-
-        class_mask = y_preds[:, class_id] > self.classification_threshold
-        c_preds_class = (c_preds[class_mask] > self.classification_threshold).int()
-        filter_attn_class = (filter_attn[class_mask, :, class_id] > self.classification_threshold).int() * 2 - 1
-        c_preds_explanation = c_preds_class * filter_attn_class
-
-        c_preds_class_cf = (c_cf[class_mask] > self.classification_threshold).int()
-        c_preds_explanation_cf = c_preds_class_cf * filter_attn_class
-        return c_preds_explanation, c_preds_explanation_cf
-    
+   
 class ConceptVCNet(StandardCBM):
     def __init__(self, input_features: int, n_concepts: int, n_classes: int, emb_size: int,
                  shield: torch.Tensor = None, train_intervention: bool = False,
                  learning_rate: float = 0.01, concept_names: list = None, task_names: list = None,
-                 task_weight: float = 0.1, bool_concepts: bool = True, deep: bool = True):
-        super().__init__(input_features, n_concepts, n_classes, emb_size, learning_rate, concept_names, task_names, task_weight, bool_concepts, deep)
+                 task_weight: float = 0.1, bool_concepts: bool = True, deep: bool = True, pos_weight=None):
+        super().__init__(input_features, n_concepts, n_classes, emb_size, learning_rate, concept_names, task_names, task_weight, bool_concepts, deep, pos_weight=pos_weight)
 
         self.concept_cf_predictor = torch.nn.Sequential(torch.nn.Linear(n_concepts + n_classes, n_concepts), torch.nn.LeakyReLU(), torch.nn.Linear(n_concepts, n_concepts))
         self.concept_predictor = torch.nn.Sequential(torch.nn.Linear(emb_size, emb_size), torch.nn.LeakyReLU(), torch.nn.Linear(emb_size, n_concepts))
         self.concept_mean_predictor = torch.nn.Sequential(torch.nn.Linear(n_concepts + n_classes, n_concepts), torch.nn.LeakyReLU(), torch.nn.Linear(n_concepts, n_concepts))
         self.concept_var_predictor = torch.nn.Sequential(torch.nn.Linear(n_concepts + n_classes, n_concepts), torch.nn.LeakyReLU(), torch.nn.Linear(n_concepts, n_concepts))
         
-        self.classification_loss = torch.nn.CrossEntropyLoss()
-        self.concept_loss = torch.nn.BCELoss()
+        if self.n_classes > 1:
+            self.classification_loss = torch.nn.CrossEntropyLoss()
+        else:
+            self.classification_loss = torch.nn.BCEWithLogitsLoss(reduction="mean")
+        self.concept_loss = torch.nn.BCELoss(weight=pos_weight)
         self.classification_threshold = 0.5 if bool_concepts else 0
 
     def _predict_concepts(self, embeddings, predictor):
@@ -1664,7 +1112,10 @@ class ConceptVCNet(StandardCBM):
         kl_loss_cf = torch.distributions.kl_divergence(q_cf, q_multivariate_normal).mean()
         reconstruction_loss = self.bce(c_cf, c_preds)
         concept_loss = self.concept_loss(c_preds, c_true.float())
-        task_loss = self.classification_loss(y_preds,  y_true.float().argmax(dim=-1))
+        if self.n_classes > 1:
+            task_loss = self.classification_loss(y_preds,  y_true.float().argmax(dim=-1))
+        else:
+            task_loss = self.classification_loss(y_preds,  y_true.float())
         loss = concept_loss + 0.5*task_loss + 0.2*reconstruction_loss + 0.8*kl_loss_cf 
 
         task_accuracy = roc_auc_score(y_true.squeeze().cpu(), y_preds.squeeze().cpu().detach())
@@ -1682,7 +1133,10 @@ class ConceptVCNet(StandardCBM):
         kl_loss_cf = torch.distributions.kl_divergence(q_cf, q_multivariate_normal).mean()
         reconstruction_loss = self.bce(c_cf, c_preds.float())
         concept_loss = self.concept_loss(c_preds, c_true.float())
-        task_loss = self.classification_loss(y_preds,  y_true.float().argmax(dim=-1))
+        if self.n_classes > 1:
+            task_loss = self.classification_loss(y_preds,  y_true.float().argmax(dim=-1))
+        else:
+            task_loss = self.classification_loss(y_preds,  y_true.float())
         # loss = concept_loss + 0.5*task_loss #+ 0.5*task_cf_loss + 0.1*distance_loss + 0.01*kl_loss + 0.01*kl_loss_cf + 0.2*int_concept_loss + 0.2*int_task_loss
         loss = concept_loss + 0.5*task_loss + 0.5*reconstruction_loss + 0.8*kl_loss_cf 
         print(reconstruction_loss, kl_loss_cf)

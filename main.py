@@ -41,22 +41,36 @@ seed_everything(seed, workers=True)
 
 # Load train data
 X, c, y = load_data(dataset_name)
+
+# Shuffle data
+rand_idx = torch.randperm(X.shape[0])
+X, c, y = X[rand_idx], c[rand_idx], y[rand_idx]
+
+X_train, X_val = X[:int(0.8*X.shape[0])], X[int(0.8*X.shape[0]):]
+c_train, c_val = c[:int(0.8*X.shape[0])], c[int(0.8*X.shape[0]):]
+y_train, y_val = y[:int(0.8*X.shape[0])], y[int(0.8*X.shape[0]):]
+
+pos_weight = None
+
+
 if len(y.shape) == 1:
+    y_train = y_train.squeeze(1)
+    y_val = y_val.squeeze(1)
     y = y.unsqueeze(1)
     # Unique [concepts, labels]
-    c_cf_set = torch.unique(torch.cat((c, y), dim=-1), dim=0)
+    c_cf_set = torch.unique(torch.cat((c_train, y_train), dim=-1), dim=0)
     concept_labels = c_cf_set[:, -1]
     c_cf_set = c_cf_set[:, :-1]
 else:
-    c_cf_set = torch.unique(torch.cat((c, torch.argmax(y, dim=-1).unsqueeze(-1)), dim=-1), dim=0)
+    c_cf_set = torch.unique(torch.cat((c_train, torch.argmax(y_train, dim=-1).unsqueeze(-1)), dim=-1), dim=0)
     concept_labels = c_cf_set[:, -1]
     c_cf_set = c_cf_set[:, :-1]
     concept_labels = one_hot(concept_labels.long(), num_classes=y.shape[1]).float()
 # Load test data
 X_test, c_test, y_test = load_data(dataset_name, split='test')
+# y_test = one_hot(y_test.squeeze(-1).long(), num_classes=2).float()
 if len(y_test.shape) == 1:
-    y_test = y_test.unsqueeze(1)
-
+    y_test = y_test.squeeze(1)
             
 # creates directory for results
 results_root_dir = f"./results/"
@@ -71,25 +85,28 @@ os.makedirs(log_dir, exist_ok=True)
 # Define model
 models = {
             'Oracle': Oracle(),
-            'DeepNN': StandardE2E(X.shape[1], y.shape[1], emb_size, learning_rate),
-            'StandardCBM': StandardCBM(X.shape[1], c.shape[1], y.shape[1], emb_size, learning_rate, bool_concepts=True, deep=True),
-            'StandardDCR': StandardDCR(X.shape[1], c.shape[1], y.shape[1], emb_size, learning_rate),
-            'CFCBM': CounterfactualCBM_V3(X.shape[1], c.shape[1], y.shape[1], emb_size, c_cf_set, concept_labels, learning_rate=learning_rate, resample=0, bernulli=False, deep=True, reconstruction=False, dataset=dataset_name) if dataset_name != 'cub'
+            'DeepNN': StandardE2E(X.shape[1], y.shape[1], emb_size, learning_rate, pos_weight),
+            'StandardCBM': StandardCBM(X.shape[1], c.shape[1], y.shape[1], emb_size, learning_rate, bool_concepts=True, deep=True, pos_weight=pos_weight),
+            'CFCBM': CounterfactualCBM_V3(X.shape[1], c.shape[1], y.shape[1], emb_size, c_cf_set, concept_labels, learning_rate=learning_rate, resample=0, bernulli=False, deep=True, reconstruction=False, dataset=dataset_name, pos_weight=pos_weight) if dataset_name != 'cub'
                     else CounterfactualCBM_V3_1(X.shape[1], c.shape[1], y.shape[1], emb_size, c_cf_set, concept_labels, learning_rate=learning_rate, resample=0, bernulli=False, deep=True, reconstruction=False),
-            'VAECF': (StandardCBM(X.shape[1], c.shape[1], y.shape[1], emb_size, learning_rate, bool_concepts=True, deep=True), 
+            'VAECF': (StandardCBM(X.shape[1], c.shape[1], y.shape[1], emb_size, learning_rate, bool_concepts=True, deep=True, pos_weight=pos_weight), 
                       VAE_CF(c.shape[1], y.shape[1], emb_size, None, learning_rate)),
-            'CCHVAE': (StandardCBM(X.shape[1], c.shape[1], y.shape[1], emb_size, learning_rate, bool_concepts=True, deep=True),
+            'CCHVAE': (StandardCBM(X.shape[1], c.shape[1], y.shape[1], emb_size, learning_rate, bool_concepts=True, deep=True, pos_weight=pos_weight),
                        CCHVAE(c.shape[1], y.shape[1], emb_size, None, learning_rate)),
-            'VCNET': ConceptVCNet(X.shape[1], c.shape[1], y.shape[1], emb_size, learning_rate, bool_concepts=True, deep=True),
-            'BayCon': StandardCBM(X.shape[1], c.shape[1], y.shape[1], emb_size, learning_rate, bool_concepts=True, deep=True),
+            'VCNET': ConceptVCNet(X.shape[1], c.shape[1], y.shape[1], emb_size, learning_rate, bool_concepts=True, deep=True, pos_weight=pos_weight),
+            'BayCon': StandardCBM(X.shape[1], c.shape[1], y.shape[1], emb_size, learning_rate, bool_concepts=True, deep=True, pos_weight=pos_weight),
         }
+
 net = models[model]
            
-train_data = TensorDataset(X, c, y)
-train_dl = torch.utils.data.DataLoader(train_data, batch_sampler=torch.utils.data.BatchSampler(RandomSamplerClassBatch(y, batch_size=batch_size, replacement=False), batch_size=batch_size, drop_last=True), pin_memory=True)
+train_data = TensorDataset(X_train, c_train, y_train)
+train_dl = torch.utils.data.DataLoader(train_data, batch_sampler=torch.utils.data.BatchSampler(RandomSamplerClassBatch(y_train, batch_size=batch_size, replacement=False), batch_size=batch_size, drop_last=True), pin_memory=True)
+val_data = TensorDataset(X_val, c_val, y_val)
+val_dl = torch.utils.data.DataLoader(val_data, batch_sampler=torch.utils.data.BatchSampler(RandomSamplerClassBatch(y_val, batch_size=batch_size, replacement=False), batch_size=batch_size,  drop_last=True), pin_memory=True)
 test_data = TensorDataset(X_test, c_test, y_test)
 test_dl = torch.utils.data.DataLoader(test_data, batch_sampler=torch.utils.data.BatchSampler(RandomSamplerClassBatch(y_test, batch_size=batch_size, replacement=False), batch_size=batch_size,  drop_last=True), pin_memory=True)
 
+train_dl = (train_dl, val_dl)
 # train model
 results, net = train(net,
                       train_dl, test_dl, 
@@ -100,7 +117,6 @@ results, net = train(net,
 # save results
 for key, value in results.items():
     wandb.run.log({key: value})
-# torch.save(results, f'{results_dir}/{model}_{fold}.pt')
 
 
 

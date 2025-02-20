@@ -10,7 +10,7 @@ parameters:
     - 42
   learning_rate:
     values:
-    - {'dsprites': 0.005, 'mnist': 0.005, 'cub': 0.005}
+    - {'dsprites': 0.005, 'mnist': 0.005, 'cub': 0.005, 'chestmnist': 0.005}
   model:
     values:
     - 'Oracle'
