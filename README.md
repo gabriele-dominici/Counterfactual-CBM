@@ -1,6 +1,6 @@
 # Climbing the Ladder of Interpretability with Counterfactual Concept Bottleneck Models
 
-Repository related to the **"Counterfactual Concept Bottleneck Models"** paper available at this [link](https://arxiv.org/abs/2402.01408).
+Repository related to the **"Counterfactual Concept Bottleneck Models"** paper available at this [link](https://arxiv.org/abs/2402.01408) and accepted at **ICLR 2025**.
 
 ### Instruction to set up the repository
 
